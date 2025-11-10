@@ -2,71 +2,83 @@ import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 import { supabaseAdmin } from '../../../../scr/lib/supabaseAdmin'
 
-/**
- * Webhook: "Opportunity Created" (GHL)
- * Filtras por pipeline en GHL y apuntas acá con ?token=...
- * Inserta en public.candidatos: (nombre_completo, fecha_creacion)
- */
+// 1) Schema que acepta: Custom Data (flat) + estándar de GHL
+const WebhookSchema = z.object({
+  // Custom Data (los que agregas en el webhook)
+  fullName: z.string().optional(),
+  firstName: z.string().optional(),
+  lastName: z.string().optional(),
+  email: z.string().optional(),
+  phone: z.string().optional(),
+  createdAt: z.union([z.string(), z.number(), z.date()]).optional(),
 
-const BodySchema = z.object({
-  // HighLevel suele mandar un objeto con contact y opportunity; deja flex/robusto
+  // Payload estándar de GHL (si viene)
   contact: z.object({
-    firstName: z.string().optional().default(''),
-    lastName: z.string().optional().default(''),
-    name: z.string().optional() // a veces viene name completo
+    firstName: z.string().optional(),
+    lastName: z.string().optional(),
+    name: z.string().optional()
   }).optional(),
   opportunity: z.object({
     id: z.string().optional(),
-    createdAt: z.union([z.string(), z.number()]).optional(), // ms epoch o ISO
+    createdAt: z.union([z.string(), z.number(), z.date()]).optional(),
     pipelineId: z.string().optional(),
-    title: z.string().optional() // a veces el título trae nombre
+    title: z.string().optional()
   }).optional()
 })
 
-function safeFullName(payload: z.infer<typeof BodySchema>) {
-  const contact = payload.contact
-  if (contact?.name && contact.name.trim()) return contact.name.trim()
-  const fn = contact?.firstName?.trim() ?? ''
-  const ln = contact?.lastName?.trim() ?? ''
+type WebhookPayload = z.infer<typeof WebhookSchema>
+
+// 2) Helpers tipados (sin any)
+function safeFullName(payload: WebhookPayload): string {
+  if (payload.fullName && payload.fullName.trim()) return payload.fullName.trim()
+
+  const fromCustom = `${payload.firstName ?? ''} ${payload.lastName ?? ''}`.trim()
+  if (fromCustom) return fromCustom
+
+  const c = payload.contact
+  if (c?.name && c.name.trim()) return c.name.trim()
+
+  const fn = c?.firstName?.trim() ?? ''
+  const ln = c?.lastName?.trim() ?? ''
   const joined = `${fn} ${ln}`.trim()
-  // fallback: opportunity.title como nombre si no hay contacto
   if (joined) return joined
+
   const title = payload.opportunity?.title?.trim() ?? ''
   return title || 'Sin nombre'
 }
 
-function parseCreatedAt(v: unknown): Date {
-  // GHL a veces manda epoch ms, otras ISO
-  if (typeof v === 'number') return new Date(v)
-  if (typeof v === 'string') {
-    const num = Number(v)
-    if (!Number.isNaN(num) && v.length >= 12) return new Date(num) // probablemente epoch ms
-    return new Date(v)
+function parseCreatedAt(value: WebhookPayload['createdAt'] | WebhookPayload['opportunity'] extends infer O
+  ? O extends { createdAt?: unknown } ? O['createdAt'] : never
+  : never): Date {
+  if (value instanceof Date) return value
+  if (typeof value === 'number') return new Date(value)
+  if (typeof value === 'string') {
+    const n = Number(value)
+    if (!Number.isNaN(n) && value.length >= 12) return new Date(n) // epoch ms
+    return new Date(value) // ISO
   }
   return new Date()
 }
 
+// 3) Handler
 export async function POST(req: NextRequest) {
   try {
-    // 1) Seguridad simple por token en query
     const url = new URL(req.url)
     const token = url.searchParams.get('token')
     if (token !== process.env.GHL_WEBHOOK_TOKEN) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // 2) Lee cuerpo
-    const json = await req.json().catch(() => ({}))
-    const parsed = BodySchema.safeParse(json)
+    const raw = await req.json().catch(() => ({}))
+    const parsed = WebhookSchema.safeParse(raw)
     if (!parsed.success) {
       return NextResponse.json({ error: 'Bad payload', details: parsed.error.flatten() }, { status: 400 })
     }
 
-    // 3) Deriva campos
-    const nombreCompleto = safeFullName(parsed.data)
-    const fecha = parseCreatedAt(parsed.data.opportunity?.createdAt)
+    const body = parsed.data
+    const nombreCompleto = safeFullName(body)
+    const fecha = parseCreatedAt(body.createdAt ?? body.opportunity?.createdAt)
 
-    // 4) Inserta en Supabase
     const { error } = await supabaseAdmin
       .from('candidatos')
       .insert([{ nombre_completo: nombreCompleto, fecha_creacion: fecha.toISOString() }])
@@ -77,16 +89,12 @@ export async function POST(req: NextRequest) {
     }
 
     return NextResponse.json({ ok: true })
-  } catch (e: unknown) {
-  console.error(e)
-  if (e instanceof Error) {
-    return NextResponse.json({ error: e.message }, { status: 500 })
+  } catch (e) {
+    console.error(e)
+    return NextResponse.json({ error: 'Server error' }, { status: 500 })
   }
-  return NextResponse.json({ error: 'Server error' }, { status: 500 })
-}
 }
 
-// Opcional: endpoint GET para healthcheck
 export async function GET() {
   return NextResponse.json({ ok: true })
 }
