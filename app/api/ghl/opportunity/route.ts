@@ -1,66 +1,126 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { z } from 'zod'
 import { supabaseAdmin } from '../../../../scr/lib/supabaseAdmin'
 
-// 1) Schema que acepta: Custom Data (flat) + estándar de GHL
-const WebhookSchema = z.object({
-  // Custom Data (los que agregas en el webhook)
-  fullName: z.string().optional(),
-  firstName: z.string().optional(),
-  lastName: z.string().optional(),
-  email: z.string().optional(),
-  phone: z.string().optional(),
-  createdAt: z.union([z.string(), z.number(), z.date()]).optional(),
+// ----------------------- helpers tipados (sin any) -----------------------
 
-  // Payload estándar de GHL (si viene)
-  contact: z.object({
-    firstName: z.string().optional(),
-    lastName: z.string().optional(),
-    name: z.string().optional()
-  }).optional(),
-  opportunity: z.object({
-    id: z.string().optional(),
-    createdAt: z.union([z.string(), z.number(), z.date()]).optional(),
-    pipelineId: z.string().optional(),
-    title: z.string().optional()
-  }).optional()
-})
+type Dict = Record<string, unknown>
 
-type WebhookPayload = z.infer<typeof WebhookSchema>
-
-// 2) Helpers tipados (sin any)
-function safeFullName(payload: WebhookPayload): string {
-  if (payload.fullName && payload.fullName.trim()) return payload.fullName.trim()
-
-  const fromCustom = `${payload.firstName ?? ''} ${payload.lastName ?? ''}`.trim()
-  if (fromCustom) return fromCustom
-
-  const c = payload.contact
-  if (c?.name && c.name.trim()) return c.name.trim()
-
-  const fn = c?.firstName?.trim() ?? ''
-  const ln = c?.lastName?.trim() ?? ''
-  const joined = `${fn} ${ln}`.trim()
-  if (joined) return joined
-
-  const title = payload.opportunity?.title?.trim() ?? ''
-  return title || 'Sin nombre'
+function isObj(v: unknown): v is Dict {
+  return typeof v === 'object' && v !== null
 }
 
-function parseCreatedAt(value: WebhookPayload['createdAt'] | WebhookPayload['opportunity'] extends infer O
-  ? O extends { createdAt?: unknown } ? O['createdAt'] : never
-  : never): Date {
-  if (value instanceof Date) return value
-  if (typeof value === 'number') return new Date(value)
-  if (typeof value === 'string') {
-    const n = Number(value)
-    if (!Number.isNaN(n) && value.length >= 12) return new Date(n) // epoch ms
-    return new Date(value) // ISO
+function get(obj: unknown, path: string): unknown {
+  if (!isObj(obj)) return undefined
+  let cur: unknown = obj
+  for (const key of path.split('.')) {
+    if (!isObj(cur)) return undefined
+    cur = (cur as Dict)[key]
+  }
+  return cur
+}
+
+function getStr(obj: unknown, path: string): string | undefined {
+  const v = get(obj, path)
+  if (typeof v === 'string') {
+    const s = v.trim()
+    return s ? s : undefined
+  }
+  return undefined
+}
+
+function getNum(obj: unknown, path: string): number | undefined {
+  const v = get(obj, path)
+  if (typeof v === 'number') return v
+  if (typeof v === 'string') {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : undefined
+  }
+  return undefined
+}
+
+function join2(a?: string, b?: string): string | undefined {
+  const s = `${a ?? ''} ${b ?? ''}`.trim()
+  return s ? s : undefined
+}
+
+function resolveFullName(body: unknown): string {
+  // 1) Top-level / custom data comunes
+  const top =
+    getStr(body, 'fullName') ??
+    getStr(body, 'full_name') ??
+    getStr(body, 'name') ??
+    join2(getStr(body, 'firstName'), getStr(body, 'lastName')) ??
+    join2(getStr(body, 'first_name'), getStr(body, 'last_name'))
+  if (top) return top
+
+  // 2) data.*
+  const fromData =
+    getStr(body, 'data.fullName') ??
+    getStr(body, 'data.full_name') ??
+    getStr(body, 'data.name') ??
+    join2(getStr(body, 'data.firstName'), getStr(body, 'data.lastName')) ??
+    join2(getStr(body, 'data.first_name'), getStr(body, 'data.last_name'))
+  if (fromData) return fromData
+
+  // 3) customData.*
+  const fromCustomData =
+    getStr(body, 'customData.fullName') ??
+    getStr(body, 'customData.full_name') ??
+    getStr(body, 'customData.name') ??
+    join2(getStr(body, 'customData.firstName'), getStr(body, 'customData.lastName')) ??
+    join2(getStr(body, 'customData.first_name'), getStr(body, 'customData.last_name'))
+  if (fromCustomData) return fromCustomData
+
+  // 4) contact.* (en cualquiera de los contenedores)
+  const fromContact =
+    getStr(body, 'contact.name') ??
+    getStr(body, 'contact.fullName') ??
+    getStr(body, 'contact.full_name') ??
+    join2(getStr(body, 'contact.firstName'), getStr(body, 'contact.lastName')) ??
+    join2(getStr(body, 'contact.first_name'), getStr(body, 'contact.last_name')) ??
+    getStr(body, 'data.contact.name') ??
+    getStr(body, 'customData.contact.name')
+  if (fromContact) return fromContact
+
+  // 5) Fallback: título de la oportunidad
+  const title =
+    getStr(body, 'title') ??
+    getStr(body, 'opportunity.title') ??
+    getStr(body, 'data.opportunity.title') ??
+    getStr(body, 'customData.opportunity.title')
+  if (title) return title
+
+  return 'Sin nombre'
+}
+
+function resolveCreatedAt(body: unknown): Date {
+  // prueba varios lugares y formatos (epoch ms / ISO / date_added)
+  const candidatesStr = [
+    'createdAt', 'created_at',
+    'data.createdAt', 'data.created_at',
+    'customData.createdAt', 'customData.created_at',
+    'opportunity.createdAt', 'opportunity.created_at',
+    'data.opportunity.createdAt', 'data.opportunity.created_at',
+    'contact.date_added', 'data.contact.date_added'
+  ]
+
+  for (const p of candidatesStr) {
+    const n = getNum(body, p)
+    if (typeof n === 'number' && String(n).length >= 12) {
+      const d = new Date(n)
+      if (!Number.isNaN(d.getTime())) return d
+    }
+    const s = getStr(body, p)
+    if (s) {
+      const d = new Date(s)
+      if (!Number.isNaN(d.getTime())) return d
+    }
   }
   return new Date()
 }
 
-// 3) Handler
+// ----------------------- handlers -----------------------
+
 export async function POST(req: NextRequest) {
   try {
     const url = new URL(req.url)
@@ -69,26 +129,24 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const raw = await req.json().catch(() => ({}))
-    const parsed = WebhookSchema.safeParse(raw)
-    if (!parsed.success) {
-      return NextResponse.json({ error: 'Bad payload', details: parsed.error.flatten() }, { status: 400 })
-    }
+    const body = await req.json().catch(() => ({} as unknown))
 
-    const body = parsed.data
-    const nombreCompleto = safeFullName(body)
-    const fecha = parseCreatedAt(body.createdAt ?? body.opportunity?.createdAt)
+    // (opcional) log para inspeccionar payload real en Vercel Logs
+    console.log('[GHL webhook body]', JSON.stringify(body))
+
+    const nombre = resolveFullName(body)
+    const fecha = resolveCreatedAt(body)
 
     const { error } = await supabaseAdmin
       .from('candidatos')
-      .insert([{ nombre_completo: nombreCompleto, fecha_creacion: fecha.toISOString() }])
+      .insert([{ nombre_completo: nombre, fecha_creacion: fecha.toISOString() }])
 
     if (error) {
       console.error('Supabase insert error', error)
       return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
     }
 
-    return NextResponse.json({ ok: true })
+    return NextResponse.json({ ok: true, nombre })
   } catch (e) {
     console.error(e)
     return NextResponse.json({ error: 'Server error' }, { status: 500 })
