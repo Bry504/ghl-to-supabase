@@ -42,6 +42,7 @@ function join2(a?: string, b?: string): string | undefined {
 }
 
 function resolveFullName(body: unknown): string {
+  // top-level y variantes comunes
   const top =
     getStr(body, 'fullName') ??
     getStr(body, 'full_name') ??
@@ -51,6 +52,7 @@ function resolveFullName(body: unknown): string {
     join2(getStr(body, 'first_name'), getStr(body, 'last_name'))
   if (top) return top
 
+  // data.*
   const fromData =
     getStr(body, 'data.fullName') ??
     getStr(body, 'data.full_name') ??
@@ -59,6 +61,7 @@ function resolveFullName(body: unknown): string {
     join2(getStr(body, 'data.first_name'), getStr(body, 'data.last_name'))
   if (fromData) return fromData
 
+  // contact.*
   const contact =
     getStr(body, 'contact.name') ??
     getStr(body, 'contact.fullName') ??
@@ -67,6 +70,7 @@ function resolveFullName(body: unknown): string {
     join2(getStr(body, 'contact.first_name'), getStr(body, 'contact.last_name'))
   if (contact) return contact
 
+  // fallback: título de la oportunidad
   const title =
     getStr(body, 'title') ??
     getStr(body, 'opportunity.title') ??
@@ -78,6 +82,7 @@ function resolveCreatedAt(body: unknown): Date {
   const candidates = [
     'createdAt','created_at',
     'data.createdAt','data.created_at',
+    'customData.createdAt','customData.created_at',
     'opportunity.createdAt','opportunity.created_at',
     'data.opportunity.createdAt','data.opportunity.created_at',
     'contact.date_added'
@@ -85,121 +90,131 @@ function resolveCreatedAt(body: unknown): Date {
   for (const p of candidates) {
     const n = getNum(body, p)
     if (typeof n === 'number' && String(n).length >= 12) {
-      const d = new Date(n)      // epoch ms
+      const d = new Date(n) // epoch ms
       if (!Number.isNaN(d.getTime())) return d
     }
     const s = getStr(body, p)
     if (s) {
-      const d = new Date(s)      // ISO
+      const d = new Date(s) // ISO
       if (!Number.isNaN(d.getTime())) return d
     }
   }
   return new Date()
+}
+
+function toUuidOrNull(s?: string): string | null {
+  if (!s) return null
+  const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+  return re.test(s) ? s : null
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const url = new URL(req.url)
+    const token = url.searchParams.get('token')
+    if (token !== process.env.GHL_WEBHOOK_TOKEN) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    function toUuidOrNull(s?: string): string | null {
-    if (!s) return null
-    const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-    return re.test(s) ? s : null
-    }
+    const body = await req.json().catch(() => ({} as unknown))
+    console.log('[GHL webhook body]', JSON.stringify(body))
 
-    export async function POST(req: NextRequest) {
-    try {
-        const url = new URL(req.url)
-        const token = url.searchParams.get('token')
-        if (token !== process.env.GHL_WEBHOOK_TOKEN) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-        }
-
-        const body = await req.json().catch(() => ({} as unknown))
-        console.log('[GHL webhook body]', JSON.stringify(body))
-
-        const nombre = resolveFullName(body)
-        const fecha = resolveCreatedAt(body)
-
-        // === mapeos a tus columnas ===
-
-    // helpers cortos
+    const nombre = resolveFullName(body)
+    const fecha  = resolveCreatedAt(body)
     const S = (p: string) => getStr(body, p)
 
+    // ---------- campos desde Custom Data / payload ----------
     const celular =
-    S('phone') ?? S('customData.phone') ?? S('contact.phone') ?? S('data.phone') ?? S('data.contact.phone')
+      S('phone') ?? S('customData.phone') ?? S('contact.phone') ?? S('data.phone') ?? S('data.contact.phone')
 
     const email =
-    S('email') ?? S('customData.email') ?? S('contact.email') ?? S('data.contact.email')
+      S('email') ?? S('customData.email') ?? S('contact.email') ?? S('data.contact.email')
 
     const dni_ce =
-    S('dni_ce') ??
-    S('customData.dni_ce') ??
-    S('contact.documento_de_identidad') ??
-    S('data.contact.documento_de_identidad')
+      S('dni_ce') ??
+      S('customData.dni_ce') ??
+      S('contact.documento_de_identidad') ??
+      S('data.contact.documento_de_identidad')
 
     const canal =
-    S('canal') ?? S('customData.canal') ?? S('opportunity.canal') ?? S('data.opportunity.canal')
+      S('canal') ?? S('customData.canal') ?? S('opportunity.canal') ?? S('data.opportunity.canal')
 
     const fuente_del_candidato =
-    S('fuente_del_candidato') ??
-    S('customData.fuente_del_candidato') ??
-    S('opportunity.fuente_del_candidato') ??
-    S('data.opportunity.fuente_del_candidato')
+      S('fuente_del_candidato') ??
+      S('customData.fuente_del_candidato') ??
+      S('opportunity.fuente_del_candidato') ??
+      S('data.opportunity.fuente_del_candidato')
 
     const estado =
-    S('estado') ??
-    S('customData.estado') ??                // <- lee tu Custom Data
-    S('opportunity.status') ??
-    S('data.opportunity.status')
+      S('estado') ??
+      S('customData.estado') ??
+      S('opportunity.status') ??
+      S('data.opportunity.status')
 
     const etapa_actual =
-    S('etapa_actual') ??
-    S('customData.etapa_actual') ??          // <- lee tu Custom Data
-    S('opportunity.stage_name') ??
-    S('opportunity.stageName') ??            // por si envía en camelCase
-    S('data.opportunity.stage_name') ??
-    S('data.opportunity.stageName')
+      S('etapa_actual') ??
+      S('customData.etapa_actual') ??
+      S('opportunity.stage_name') ?? S('opportunity.stageName') ??
+      S('data.opportunity.stage_name') ?? S('data.opportunity.stageName')
 
     const hl_opportunity_id =
-    S('hl_opportunity_id') ??
-    S('hl_opportunity') ??                   // por si lo nombraste así
-    S('customData.hl_opportunity_id') ??
-    S('customData.opportunityId') ??         // <- tu Custom Data de la captura
-    S('opportunityId') ??
-    S('opportunity.id') ??
-    S('data.opportunity.id')
+      S('hl_opportunity_id') ?? S('hl_opportunity') ??
+      S('customData.hl_opportunity_id') ?? S('customData.opportunityId') ??
+      S('opportunityId') ?? S('opportunity.id') ?? S('data.opportunity.id')
 
     const hl_pipeline_id =
-    S('hl_pipeline_id') ??
-    S('customData.hl_pipeline_id') ??
-    S('customData.pipelineId') ??            // <- tu Custom Data de la captura
-    S('pipelineId') ??
-    S('opportunity.pipeline_id') ??
-    S('opportunity.pipelineId') ??           // camelCase posible
-    S('data.opportunity.pipeline_id') ??
-    S('data.opportunity.pipelineId')
+      S('hl_pipeline_id') ??
+      S('customData.hl_pipeline_id') ?? S('customData.pipelineId') ??
+      S('pipelineId') ??
+      S('opportunity.pipeline_id') ?? S('opportunity.pipelineId') ??
+      S('data.opportunity.pipeline_id') ?? S('data.opportunity.pipelineId')
 
-    // OJO propietario_id es UUID en tu tabla: solo guarda si luce como UUID
-    const propietario_id = toUuidOrNull(
-    S('propietario') ?? S('customData.propietario') ?? S('opportunity.assignedTo') ?? S('data.opportunity.assignedTo')
-    )
+    // Mapear propietario: buscar en tabla usuarios por usuarios.ghl_id
+    const ownerGhlId =
+      S('propietario') ?? S('customData.propietario') ??
+      S('opportunity.assignedTo') ?? S('data.opportunity.assignedTo')
 
-    const row = {
-    nombre_completo: nombre,
-    fecha_creacion: fecha.toISOString(),
-    celular: celular ?? null,
-    dni_ce: dni_ce ?? null,
-    email: email ?? null,
-    canal: canal ?? null,
-    fuente_del_candidato: fuente_del_candidato ?? null,
-    estado: estado ?? null,
-    etapa_actual: etapa_actual ?? null,
-    hl_opportunity_id: hl_opportunity_id ?? null,
-    hl_pipeline_id: hl_pipeline_id ?? null,
-    propietario_id, // null si no es UUID válido
-    updated_at: new Date().toISOString()
+    let propietario_id: string | null = null
+    if (ownerGhlId) {
+      const { data: ownerRow, error: ownerErr } = await supabaseAdmin
+        .from('usuarios')
+        .select('id')
+        .eq('ghl_id', ownerGhlId)
+        .maybeSingle()
+      if (!ownerErr && ownerRow?.id) propietario_id = ownerRow.id
     }
-    const { error } = await supabaseAdmin.from('candidatos').insert([row])
-    if (error) {
-      console.error('Supabase insert error', error)
-      return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
+
+    // ---------- upsert por idempotencia (conflict: hl_opportunity_id) ----------
+    const row = {
+      nombre_completo: nombre,
+      fecha_creacion: fecha.toISOString(),
+      celular: celular ?? null,
+      dni_ce: dni_ce ?? null,
+      email: email ?? null,
+      canal: canal ?? null,
+      fuente_del_candidato: fuente_del_candidato ?? null,
+      estado: estado ?? null,
+      etapa_actual: etapa_actual ?? null,
+      hl_opportunity_id: hl_opportunity_id ?? null,
+      hl_pipeline_id: hl_pipeline_id ?? null,
+      propietario_id,
+      updated_at: new Date().toISOString()
+    }
+
+    if (hl_opportunity_id) {
+      const { error } = await supabaseAdmin
+        .from('candidatos')
+        .upsert(row, { onConflict: 'hl_opportunity_id', ignoreDuplicates: false })
+      if (error) {
+        console.error('Supabase upsert error', error)
+        return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
+      }
+    } else {
+      const { error } = await supabaseAdmin.from('candidatos').insert([row])
+      if (error) {
+        console.error('Supabase insert error', error)
+        return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
+      }
     }
 
     return NextResponse.json({ ok: true })
