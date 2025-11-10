@@ -95,103 +95,107 @@ function resolveCreatedAt(body: unknown): Date {
     }
   }
   return new Date()
-}
-
-function toUuidOrNull(s?: string): string | null {
-  if (!s) return null
-  const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-  return re.test(s) ? s : null
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const url = new URL(req.url)
-    const token = url.searchParams.get('token')
-    if (token !== process.env.GHL_WEBHOOK_TOKEN) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const body = await req.json().catch(() => ({} as unknown))
-    console.log('[GHL webhook body]', JSON.stringify(body))
+    function toUuidOrNull(s?: string): string | null {
+    if (!s) return null
+    const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    return re.test(s) ? s : null
+    }
 
-    const nombre = resolveFullName(body)
-    const fecha = resolveCreatedAt(body)
+    export async function POST(req: NextRequest) {
+    try {
+        const url = new URL(req.url)
+        const token = url.searchParams.get('token')
+        if (token !== process.env.GHL_WEBHOOK_TOKEN) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+        }
 
-    // === mapeos a tus columnas ===
+        const body = await req.json().catch(() => ({} as unknown))
+        console.log('[GHL webhook body]', JSON.stringify(body))
+
+        const nombre = resolveFullName(body)
+        const fecha = resolveCreatedAt(body)
+
+        // === mapeos a tus columnas ===
+
+    // helpers cortos
+    const S = (p: string) => getStr(body, p)
+
     const celular =
-      getStr(body, 'phone') ??
-      getStr(body, 'contact.phone') ??
-      getStr(body, 'data.phone') ??
-      getStr(body, 'data.contact.phone')
+    S('phone') ?? S('customData.phone') ?? S('contact.phone') ?? S('data.phone') ?? S('data.contact.phone')
 
     const email =
-      getStr(body, 'email') ??
-      getStr(body, 'contact.email') ??
-      getStr(body, 'data.contact.email')
+    S('email') ?? S('customData.email') ?? S('contact.email') ?? S('data.contact.email')
 
     const dni_ce =
-      getStr(body, 'dni_ce') ??
-      getStr(body, 'contact.documento_de_identidad') ??
-      getStr(body, 'contact.dni') ??
-      getStr(body, 'data.contact.documento_de_identidad')
+    S('dni_ce') ??
+    S('customData.dni_ce') ??
+    S('contact.documento_de_identidad') ??
+    S('data.contact.documento_de_identidad')
 
     const canal =
-      getStr(body, 'canal') ??
-      getStr(body, 'opportunity.canal') ??
-      getStr(body, 'data.opportunity.canal')
+    S('canal') ?? S('customData.canal') ?? S('opportunity.canal') ?? S('data.opportunity.canal')
 
     const fuente_del_candidato =
-      getStr(body, 'fuente_del_candidato') ??
-      getStr(body, 'opportunity.fuente_del_candidato') ??
-      getStr(body, 'data.opportunity.fuente_del_candidato')
+    S('fuente_del_candidato') ??
+    S('customData.fuente_del_candidato') ??
+    S('opportunity.fuente_del_candidato') ??
+    S('data.opportunity.fuente_del_candidato')
 
     const estado =
-      getStr(body, 'estado') ??
-      getStr(body, 'opportunity.status') ??
-      getStr(body, 'data.opportunity.status')
+    S('estado') ??
+    S('customData.estado') ??                // <- lee tu Custom Data
+    S('opportunity.status') ??
+    S('data.opportunity.status')
 
     const etapa_actual =
-      getStr(body, 'etapa_actual') ??
-      getStr(body, 'opportunity.stage_name') ??
-      getStr(body, 'data.opportunity.stage_name')
+    S('etapa_actual') ??
+    S('customData.etapa_actual') ??          // <- lee tu Custom Data
+    S('opportunity.stage_name') ??
+    S('opportunity.stageName') ??            // por si envía en camelCase
+    S('data.opportunity.stage_name') ??
+    S('data.opportunity.stageName')
 
     const hl_opportunity_id =
-      getStr(body, 'hl_opportunity') ??
-      getStr(body, 'hl_opportunity_id') ??
-      getStr(body, 'opportunityId') ??
-      getStr(body, 'opportunity.id') ??
-      getStr(body, 'data.opportunity.id')
+    S('hl_opportunity_id') ??
+    S('hl_opportunity') ??                   // por si lo nombraste así
+    S('customData.hl_opportunity_id') ??
+    S('customData.opportunityId') ??         // <- tu Custom Data de la captura
+    S('opportunityId') ??
+    S('opportunity.id') ??
+    S('data.opportunity.id')
 
     const hl_pipeline_id =
-      getStr(body, 'pipelineId') ??
-      getStr(body, 'hl_pipeline_id') ??
-      getStr(body, 'opportunity.pipeline_id') ??
-      getStr(body, 'data.opportunity.pipeline_id')
+    S('hl_pipeline_id') ??
+    S('customData.hl_pipeline_id') ??
+    S('customData.pipelineId') ??            // <- tu Custom Data de la captura
+    S('pipelineId') ??
+    S('opportunity.pipeline_id') ??
+    S('opportunity.pipelineId') ??           // camelCase posible
+    S('data.opportunity.pipeline_id') ??
+    S('data.opportunity.pipelineId')
 
-    // OJO: en tu tabla la columna es propietario_id (uuid).
-    // GHL `assignedTo` suele ser un id string propio (no siempre UUID). Guardamos solo si pasa regex UUID.
+    // OJO propietario_id es UUID en tu tabla: solo guarda si luce como UUID
     const propietario_id = toUuidOrNull(
-      getStr(body, 'propietario') ??
-      getStr(body, 'opportunity.assignedTo') ??
-      getStr(body, 'data.opportunity.assignedTo')
+    S('propietario') ?? S('customData.propietario') ?? S('opportunity.assignedTo') ?? S('data.opportunity.assignedTo')
     )
 
     const row = {
-      nombre_completo: nombre,
-      fecha_creacion: fecha.toISOString(),
-      celular: celular ?? null,
-      dni_ce: dni_ce ?? null,
-      email: email ?? null,
-      canal: canal ?? null,
-      fuente_del_candidato: fuente_del_candidato ?? null,
-      estado: estado ?? null,
-      etapa_actual: etapa_actual ?? null,
-      hl_opportunity_id: hl_opportunity_id ?? null,
-      hl_pipeline_id: hl_pipeline_id ?? null,
-      propietario_id,                // null si no es UUID válido
-      updated_at: new Date().toISOString()
+    nombre_completo: nombre,
+    fecha_creacion: fecha.toISOString(),
+    celular: celular ?? null,
+    dni_ce: dni_ce ?? null,
+    email: email ?? null,
+    canal: canal ?? null,
+    fuente_del_candidato: fuente_del_candidato ?? null,
+    estado: estado ?? null,
+    etapa_actual: etapa_actual ?? null,
+    hl_opportunity_id: hl_opportunity_id ?? null,
+    hl_pipeline_id: hl_pipeline_id ?? null,
+    propietario_id, // null si no es UUID válido
+    updated_at: new Date().toISOString()
     }
-
     const { error } = await supabaseAdmin.from('candidatos').insert([row])
     if (error) {
       console.error('Supabase insert error', error)
