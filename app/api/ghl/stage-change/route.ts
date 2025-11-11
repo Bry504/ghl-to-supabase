@@ -22,7 +22,7 @@ const N = (o: unknown, p: string) => {
 function resolveDate(body: unknown): Date {
   const cand = [
     'changedAt','changed_at',
-    'data.changedAt','data.changed_at',
+    'customData.changedAt','customData.changed_at',
     'opportunity.updatedAt','opportunity.updated_at',
     'data.opportunity.updatedAt','data.opportunity.updated_at'
   ]
@@ -47,15 +47,10 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({} as unknown))
     console.log('[GHL stage-change body]', JSON.stringify(body))
 
-    // Custom Data esperados en GHL:
-    // opportunityId, pipelineId, oldStageName, newStageName, changedAt, userGhlId (opcional)
+    // Lo mínimo que necesitamos:
     const hlOpportunityId =
       S(body, 'customData.opportunityId') ?? S(body, 'opportunityId') ??
       S(body, 'opportunity.id') ?? S(body, 'data.opportunity.id')
-
-    const etapaOrigen =
-      S(body, 'customData.oldStageName') ?? S(body, 'oldStageName') ??
-      S(body, 'opportunity.oldStageName') ?? S(body, 'data.opportunity.oldStageName')
 
     const etapaDestino =
       S(body, 'customData.newStageName') ?? S(body, 'newStageName') ??
@@ -68,18 +63,35 @@ export async function POST(req: NextRequest) {
       S(body, 'customData.userGhlId') ?? S(body, 'userGhlId') ??
       S(body, 'opportunity.updatedBy') ?? S(body, 'data.opportunity.updatedBy')
 
-    // encontrar candidato por hl_opportunity_id
-    let candidatoId: string | null = null
-    if (hlOpportunityId) {
-      const { data: cand } = await supabaseAdmin
-        .from('candidatos')
-        .select('id')
-        .eq('hl_opportunity_id', hlOpportunityId)
-        .maybeSingle()
-      if (cand?.id) candidatoId = cand.id
+    if (!hlOpportunityId || !etapaDestino) {
+      return NextResponse.json({ error: 'Missing opportunityId or stage' }, { status: 400 })
     }
 
-    // mapear usuario (si mandas userGhlId en custom data)
+    // 1) Encontrar candidato y su etapa actual (para usarla como ORIGEN)
+    const { data: cand } = await supabaseAdmin
+    .from('candidatos')
+    .select('id, etapa_actual')
+    .eq('hl_opportunity_id', hlOpportunityId)
+    .maybeSingle()
+
+    // Usa const para la que no se reasigna
+    const candidatoId: string | null = cand?.id ?? null
+    // Usa let para la que sí puede cambiar en el fallback
+    let etapaOrigen: string | null = cand?.etapa_actual ?? null
+
+    // Fallback: si por alguna razón etapa_actual está vacía, miramos el último historial
+    if (candidatoId && !etapaOrigen) {
+    const { data: lastHist } = await supabaseAdmin
+        .from('historial_etapas')
+        .select('etapa_destino')
+        .eq('candidato_id', candidatoId)
+        .order('changed_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+    if (lastHist?.etapa_destino) etapaOrigen = lastHist.etapa_destino
+    }
+
+    // Mapear usuario_id desde usuarios.ghl_id (si llegó)
     let usuarioId: string | null = null
     if (userGhlId) {
       const { data: usr } = await supabaseAdmin
@@ -90,12 +102,12 @@ export async function POST(req: NextRequest) {
       if (usr?.id) usuarioId = usr.id
     }
 
-    // inserta en historial
+    // 2) Insertar en historial; el trigger actualizará candidatos.etapa_actual
     const { error } = await supabaseAdmin.from('historial_etapas').insert([{
       candidato_id: candidatoId,
-      hl_opportunity_id: hlOpportunityId ?? null,
-      etapa_origen: etapaOrigen ?? null,
-      etapa_destino: etapaDestino ?? null,
+      hl_opportunity_id: hlOpportunityId,
+      etapa_origen: etapaOrigen,
+      etapa_destino: etapaDestino,
       changed_at: changedAt.toISOString(),
       source: 'WEBHOOK_HL',
       usuario_id: usuarioId
@@ -106,7 +118,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
     }
 
-    // El trigger actualizará candidatos.etapa_actual y stage_changed_at
     return NextResponse.json({ ok: true })
   } catch (e) {
     console.error(e)
