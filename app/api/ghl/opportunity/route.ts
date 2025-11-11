@@ -42,17 +42,15 @@ function join2(a?: string, b?: string): string | undefined {
 }
 
 function resolveFullName(body: unknown): string {
-  // top-level y variantes comunes
   const top =
     getStr(body, 'fullName') ??
     getStr(body, 'full_name') ??
     getStr(body, 'name') ??
     join2(getStr(body, 'firstName'), getStr(body, 'lastName')) ??
-    join2(getStr(body, 'firstname'), getStr(body, 'lastName')) ?? // por tu custom key "firstname"
+    join2(getStr(body, 'firstname'), getStr(body, 'lastName')) ??
     join2(getStr(body, 'first_name'), getStr(body, 'last_name'))
   if (top) return top
 
-  // data.*
   const fromData =
     getStr(body, 'data.fullName') ??
     getStr(body, 'data.full_name') ??
@@ -61,7 +59,6 @@ function resolveFullName(body: unknown): string {
     join2(getStr(body, 'data.first_name'), getStr(body, 'data.last_name'))
   if (fromData) return fromData
 
-  // contact.*
   const contact =
     getStr(body, 'contact.name') ??
     getStr(body, 'contact.fullName') ??
@@ -70,7 +67,6 @@ function resolveFullName(body: unknown): string {
     join2(getStr(body, 'contact.first_name'), getStr(body, 'contact.last_name'))
   if (contact) return contact
 
-  // fallback: título de la oportunidad
   const title =
     getStr(body, 'title') ??
     getStr(body, 'opportunity.title') ??
@@ -80,32 +76,26 @@ function resolveFullName(body: unknown): string {
 
 function resolveCreatedAt(body: unknown): Date {
   const candidates = [
-    'createdAt','created_at',
-    'data.createdAt','data.created_at',
-    'customData.createdAt','customData.created_at',
-    'opportunity.createdAt','opportunity.created_at',
-    'data.opportunity.createdAt','data.opportunity.created_at',
+    'createdAt', 'created_at',
+    'data.createdAt', 'data.created_at',
+    'customData.createdAt', 'customData.created_at',
+    'opportunity.createdAt', 'opportunity.created_at',
+    'data.opportunity.createdAt', 'data.opportunity.created_at',
     'contact.date_added'
   ]
   for (const p of candidates) {
     const n = getNum(body, p)
     if (typeof n === 'number' && String(n).length >= 12) {
-      const d = new Date(n) // epoch ms
+      const d = new Date(n)
       if (!Number.isNaN(d.getTime())) return d
     }
     const s = getStr(body, p)
     if (s) {
-      const d = new Date(s) // ISO
+      const d = new Date(s)
       if (!Number.isNaN(d.getTime())) return d
     }
   }
   return new Date()
-}
-
-function toUuidOrNull(s?: string): string | null {
-  if (!s) return null
-  const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-  return re.test(s) ? s : null
 }
 
 export async function POST(req: NextRequest) {
@@ -169,7 +159,7 @@ export async function POST(req: NextRequest) {
       S('opportunity.pipeline_id') ?? S('opportunity.pipelineId') ??
       S('data.opportunity.pipeline_id') ?? S('data.opportunity.pipelineId')
 
-    // Mapear propietario: buscar en tabla usuarios por usuarios.ghl_id
+    // propietario: buscar en usuarios por usuarios.ghl_id
     const ownerGhlId =
       S('propietario') ?? S('customData.propietario') ??
       S('opportunity.assignedTo') ?? S('data.opportunity.assignedTo')
@@ -214,6 +204,29 @@ export async function POST(req: NextRequest) {
       if (error) {
         console.error('Supabase insert error', error)
         return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
+      }
+    }
+
+    // ---------- insertar una línea inicial en historial_etapas (source = SISTEMA) ----------
+    if (hl_opportunity_id && etapa_actual) {
+      // buscar id del candidato recién upserteado
+      const { data: candRow } = await supabaseAdmin
+        .from('candidatos')
+        .select('id')
+        .eq('hl_opportunity_id', hl_opportunity_id)
+        .maybeSingle()
+
+      if (candRow?.id) {
+        await supabaseAdmin.from('historial_etapas').insert([{
+          candidato_id: candRow.id,
+          hl_opportunity_id,
+          etapa_origen: null,
+          etapa_destino: etapa_actual,
+          changed_at: fecha.toISOString(),
+          source: 'SISTEMA',
+          usuario_id: propietario_id
+        }])
+        // el trigger actualizará candidatos.etapa_actual y stage_changed_at
       }
     }
 
