@@ -56,16 +56,13 @@ export async function POST(req: NextRequest) {
       S(body, 'opportunity.stage_name') ?? S(body, 'opportunity.stageName') ??
       S(body, 'data.opportunity.stage_name') ?? S(body, 'data.opportunity.stageName')
 
-    const changedAt = resolveDate(body)
-    const userGhlId =
-      S(body, 'customData.userGhlId') ?? S(body, 'userGhlId') ??
-      S(body, 'opportunity.updatedBy') ?? S(body, 'data.opportunity.updatedBy')
-
     if (!hlOpportunityId || !etapaDestino) {
       return NextResponse.json({ error: 'Missing opportunityId or stage' }, { status: 400 })
     }
 
-    // 1) Buscar candidato
+    const changedAt = resolveDate(body)
+
+    // Debe existir el candidato YA (si no, no es un cambio válido)
     const { data: cand } = await supabaseAdmin
       .from('candidatos')
       .select('id, etapa_actual')
@@ -74,15 +71,14 @@ export async function POST(req: NextRequest) {
 
     const candidatoId: string | null = cand?.id ?? null
     let etapaOrigen: string | null = cand?.etapa_actual ?? null
-
     if (!candidatoId) {
       return NextResponse.json({ ok: true, skipped: 'no-candidato-yet' })
     }
 
-    // Último historial
+    // Último historial para definir origen real y evitar duplicados
     const { data: lastHist } = await supabaseAdmin
       .from('historial_etapas')
-      .select('etapa_destino, source')
+      .select('etapa_destino, source, changed_at')
       .eq('hl_opportunity_id', hlOpportunityId)
       .order('changed_at', { ascending: false })
       .limit(1)
@@ -92,17 +88,29 @@ export async function POST(req: NextRequest) {
       etapaOrigen = lastHist.etapa_destino
     }
 
-    // Ignorar si es el primer evento (ya lo manejó el webhook de creación)
+    // Si no hay historial previo (raro) y tampoco origen, no registramos: creación no se procesó aún
     if (!lastHist && !etapaOrigen) {
-      return NextResponse.json({ ok: true, skipped: 'initial-event-handled-by-opportunity' })
+      return NextResponse.json({ ok: true, skipped: 'initial-not-ready' })
     }
 
-    // Ignorar si no hay cambio real
+    // Evitar “sin cambio real”
     if (etapaOrigen && etapaDestino && etapaOrigen === etapaDestino) {
       return NextResponse.json({ ok: true, skipped: 'no-stage-change' })
     }
 
-    // Mapear usuario_id
+    // Debounce: si el último fue SISTEMA con mismo destino hace < 90s, ignorar
+    if (lastHist?.source === 'SISTEMA' && lastHist?.etapa_destino === etapaDestino) {
+      const lastTs = new Date(lastHist.changed_at as string).getTime()
+      if (changedAt.getTime() - lastTs < 90_000) {
+        return NextResponse.json({ ok: true, skipped: 'debounced-dup-after-create' })
+      }
+    }
+
+    // usuario (opcional)
+    const userGhlId =
+      S(body, 'customData.userGhlId') ?? S(body, 'userGhlId') ??
+      S(body, 'opportunity.updatedBy') ?? S(body, 'data.opportunity.updatedBy')
+
     let usuarioId: string | null = null
     if (userGhlId) {
       const { data: usr } = await supabaseAdmin
@@ -113,9 +121,9 @@ export async function POST(req: NextRequest) {
       usuarioId = usr?.id ?? null
     }
 
-    // 3) Insertar historial
-    const { error } = await supabaseAdmin.from('historial_etapas').insert([{
-      candidato_id: candidatoId,
+    // Insertar historial (si llegamos hasta aquí, hay cambio real)
+    const { error: histErr } = await supabaseAdmin.from('historial_etapas').insert([{
+      candidato_id: candidatoId,              // <- siempre lo ponemos
       hl_opportunity_id: hlOpportunityId,
       etapa_origen: etapaOrigen,
       etapa_destino: etapaDestino,
@@ -124,9 +132,9 @@ export async function POST(req: NextRequest) {
       usuario_id: usuarioId
     }])
 
-    if (error) {
-      console.error('Supabase insert historial error', error)
-      return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
+    if (histErr) {
+      console.error('Supabase insert historial error', histErr)
+      return NextResponse.json({ ok: false, error: histErr.message }, { status: 500 })
     }
 
     return NextResponse.json({ ok: true })
