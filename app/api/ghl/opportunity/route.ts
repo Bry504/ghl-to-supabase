@@ -110,71 +110,65 @@ export async function POST(req: NextRequest) {
     console.log('[GHL webhook body]', JSON.stringify(body))
 
     const nombre = resolveFullName(body)
-    const fecha  = resolveCreatedAt(body)
+    const fecha = resolveCreatedAt(body)
     const S = (p: string) => getStr(body, p)
 
-    // ---------- campos desde Custom Data / payload ----------
     const celular =
-      S('phone') ?? S('customData.phone') ?? S('contact.phone') ?? S('data.phone') ?? S('data.contact.phone')
-
+      S('phone') ?? S('customData.phone') ?? S('contact.phone') ?? S('data.contact.phone')
     const email =
       S('email') ?? S('customData.email') ?? S('contact.email') ?? S('data.contact.email')
-
     const dni_ce =
       S('dni_ce') ??
       S('customData.dni_ce') ??
       S('contact.documento_de_identidad') ??
       S('data.contact.documento_de_identidad')
-
     const canal =
       S('canal') ?? S('customData.canal') ?? S('opportunity.canal') ?? S('data.opportunity.canal')
-
     const fuente_del_candidato =
       S('fuente_del_candidato') ??
       S('customData.fuente_del_candidato') ??
       S('opportunity.fuente_del_candidato') ??
       S('data.opportunity.fuente_del_candidato')
-
     const estado =
       S('estado') ??
       S('customData.estado') ??
       S('opportunity.status') ??
       S('data.opportunity.status')
-
     const etapa_actual =
       S('etapa_actual') ??
       S('customData.etapa_actual') ??
-      S('opportunity.stage_name') ?? S('opportunity.stageName') ??
-      S('data.opportunity.stage_name') ?? S('data.opportunity.stageName')
-
+      S('opportunity.stage_name') ??
+      S('opportunity.stageName') ??
+      S('data.opportunity.stage_name') ??
+      S('data.opportunity.stageName')
     const hl_opportunity_id =
-      S('hl_opportunity_id') ?? S('hl_opportunity') ??
-      S('customData.hl_opportunity_id') ?? S('customData.opportunityId') ??
-      S('opportunityId') ?? S('opportunity.id') ?? S('data.opportunity.id')
-
+      S('hl_opportunity_id') ??
+      S('customData.hl_opportunity_id') ??
+      S('opportunityId') ??
+      S('opportunity.id') ??
+      S('data.opportunity.id')
     const hl_pipeline_id =
       S('hl_pipeline_id') ??
-      S('customData.hl_pipeline_id') ?? S('customData.pipelineId') ??
+      S('customData.hl_pipeline_id') ??
       S('pipelineId') ??
-      S('opportunity.pipeline_id') ?? S('opportunity.pipelineId') ??
-      S('data.opportunity.pipeline_id') ?? S('data.opportunity.pipelineId')
-
-    // propietario: buscar en usuarios por usuarios.ghl_id
+      S('opportunity.pipeline_id') ??
+      S('data.opportunity.pipeline_id')
     const ownerGhlId =
-      S('propietario') ?? S('customData.propietario') ??
-      S('opportunity.assignedTo') ?? S('data.opportunity.assignedTo')
+      S('propietario') ??
+      S('customData.propietario') ??
+      S('opportunity.assignedTo') ??
+      S('data.opportunity.assignedTo')
 
     let propietario_id: string | null = null
     if (ownerGhlId) {
-      const { data: ownerRow, error: ownerErr } = await supabaseAdmin
+      const { data: ownerRow } = await supabaseAdmin
         .from('usuarios')
         .select('id')
         .eq('ghl_id', ownerGhlId)
         .maybeSingle()
-      if (!ownerErr && ownerRow?.id) propietario_id = ownerRow.id
+      propietario_id = ownerRow?.id ?? null
     }
 
-    // ---------- upsert por idempotencia (conflict: hl_opportunity_id) ----------
     const row = {
       nombre_completo: nombre,
       fecha_creacion: fecha.toISOString(),
@@ -188,7 +182,7 @@ export async function POST(req: NextRequest) {
       hl_opportunity_id: hl_opportunity_id ?? null,
       hl_pipeline_id: hl_pipeline_id ?? null,
       propietario_id,
-      updated_at: new Date().toISOString()
+      updated_at: new Date().toISOString(),
     }
 
     if (hl_opportunity_id) {
@@ -199,34 +193,34 @@ export async function POST(req: NextRequest) {
         console.error('Supabase upsert error', error)
         return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
       }
-    } else {
-      const { error } = await supabaseAdmin.from('candidatos').insert([row])
-      if (error) {
-        console.error('Supabase insert error', error)
-        return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
-      }
     }
 
-    // ---------- insertar una línea inicial en historial_etapas (source = SISTEMA) ----------
+    // ---- Previene duplicado en historial ----
     if (hl_opportunity_id && etapa_actual) {
-      // buscar id del candidato recién upserteado
-      const { data: candRow } = await supabaseAdmin
-        .from('candidatos')
+      const { data: already } = await supabaseAdmin
+        .from('historial_etapas')
         .select('id')
         .eq('hl_opportunity_id', hl_opportunity_id)
-        .maybeSingle()
+        .limit(1)
 
-      if (candRow?.id) {
-        await supabaseAdmin.from('historial_etapas').insert([{
-          candidato_id: candRow.id,
-          hl_opportunity_id,
-          etapa_origen: null,
-          etapa_destino: etapa_actual,
-          changed_at: fecha.toISOString(),
-          source: 'SISTEMA',
-          usuario_id: propietario_id
-        }])
-        // el trigger actualizará candidatos.etapa_actual y stage_changed_at
+      if (!already || already.length === 0) {
+        const { data: candRow } = await supabaseAdmin
+          .from('candidatos')
+          .select('id')
+          .eq('hl_opportunity_id', hl_opportunity_id)
+          .maybeSingle()
+
+        if (candRow?.id) {
+          await supabaseAdmin.from('historial_etapas').insert([{
+            candidato_id: candRow.id,
+            hl_opportunity_id,
+            etapa_origen: null,
+            etapa_destino: etapa_actual,
+            changed_at: fecha.toISOString(),
+            source: 'SISTEMA',
+            usuario_id: propietario_id
+          }])
+        }
       }
     }
 
