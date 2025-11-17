@@ -15,7 +15,7 @@ interface ContactRow {
 
 interface CandidateRow {
   id: string;              // candidatos.id (uuid)
-  fecha_creacion: string;  // candidatos.fecha_creacion (timestamp)
+  created_at: string;  // candidatos.created_at (timestamp)
 }
 
 interface CitaRowInsert {
@@ -192,9 +192,9 @@ export async function POST(req: NextRequest) {
     // 8) Buscar la ÚLTIMA oportunidad (candidato) de ese contacto
     const { data: candidatoRow, error: candidatoError } = await supabaseAdmin
       .from('candidatos')
-      .select<'id, fecha_creacion', CandidateRow>('id, fecha_creacion')
+      .select<'id, created_at', CandidateRow>('id, created_at')
       .eq('contacto_id', contactoId)
-      .order('fecha_creacion', { ascending: false })
+      .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
 
