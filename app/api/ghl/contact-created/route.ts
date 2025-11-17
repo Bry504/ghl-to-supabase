@@ -53,12 +53,32 @@ function getStringField(
   return null;
 }
 
+// Busca en customData y luego en root, con alias
+function getFromSources(
+  primary: string,
+  aliases: string[],
+  root: Record<string, unknown>,
+  custom: Record<string, unknown>
+): string | null {
+  let value = getStringField(custom, primary);
+  if (value !== null) return value;
+
+  value = getStringField(root, primary);
+  if (value !== null) return value;
+
+  for (const alias of aliases) {
+    value = getStringField(custom, alias) ?? getStringField(root, alias);
+    if (value !== null) return value;
+  }
+
+  return null;
+}
+
 export async function POST(req: NextRequest) {
   try {
-    // 1) Validar token en querystring
+    // 1) Validar token
     const url = new URL(req.url);
     const tokenFromQuery = url.searchParams.get('token');
-
     const expectedToken =
       process.env.GHL_CONTACT_CREATED_TOKEN ??
       'pit-18b2740c-0b32-40a1-8624-1148633a0f15';
@@ -70,9 +90,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 2) Leer body sin usar any
+    // 2) Leer body
     const rawBody: unknown = await req.json();
-
     if (!isRecord(rawBody)) {
       return NextResponse.json(
         { ok: false, error: 'Invalid payload format' },
@@ -80,52 +99,90 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3) Resolver hl_contact_id desde varias posibles claves
+    const root = rawBody;
+
+    // 3) Extraer contact y customData
+    let contactObj: Record<string, unknown> = {};
+    if ('contact' in root && isRecord(root['contact'])) {
+      contactObj = root['contact'] as Record<string, unknown>;
+    }
+
+    let customData: Record<string, unknown> = {};
+    if ('customData' in root && isRecord(root['customData'])) {
+      customData = root['customData'] as Record<string, unknown>;
+    }
+
+    // 4) Resolver hl_contact_id (id de HL)
     const hlContactIdFromRoot =
-      getStringField(rawBody, 'hl_contact_id') ??
-      getStringField(rawBody, 'contact_id') ??
-      getStringField(rawBody, 'id');
+      getStringField(root, 'hl_contact_id') ??
+      getStringField(root, 'contact_id') ??
+      getStringField(root, 'id');
 
     let hlContactId: string | null = hlContactIdFromRoot;
 
-    if (!hlContactId && 'contact' in rawBody) {
-      const contactObj = rawBody['contact'];
-      if (isRecord(contactObj)) {
-        hlContactId = getStringField(contactObj, 'id');
-      }
+    if (!hlContactId) {
+      hlContactId =
+        getStringField(contactObj, 'id') ??
+        getStringField(customData, 'hl_contact_id');
     }
 
     if (!hlContactId) {
-      // Logueamos lo que llegó para debug (sin romper tipos)
-      console.error('Body sin hl_contact_id reconocible:', rawBody);
+      console.error('Body sin hl_contact_id reconocible:', root);
       return NextResponse.json(
         { ok: false, error: 'Missing hl_contact_id' },
         { status: 400 }
       );
     }
 
-    // 4) Extraer y limpiar campos opcionales
+    // 5) Extraer campos con alias (nombres abreviados de tu workflow)
     const cleaned: ContactPayloadClean = {
       hl_contact_id: hlContactId,
-      nombre_completo: getStringField(rawBody, 'nombre_completo'),
-      celular: getStringField(rawBody, 'celular'),
-      dni_ce: getStringField(rawBody, 'dni_ce'),
-      estado_civil: getStringField(rawBody, 'estado_civil'),
-      distrito_de_residencia: getStringField(
-        rawBody,
-        'distrito_de_residencia'
+      nombre_completo: getFromSources(
+        'nombre_completo',
+        ['nombre_comp'],
+        root,
+        customData
       ),
-      profesion: getStringField(rawBody, 'profesion'),
-      email: getStringField(rawBody, 'email'),
-      fuente: getStringField(rawBody, 'fuente'),
-      detalle: getStringField(rawBody, 'detalle'),
-      sub_detalle: getStringField(rawBody, 'sub_detalle'),
-      sub_sub_detalle: getStringField(rawBody, 'sub_sub_detalle'),
-      sub_sub_sub_detalle: getStringField(rawBody, 'sub_sub_sub_detalle'),
-      fecha_de_nacimiento: getStringField(rawBody, 'fecha_de_nacimiento')
+      celular: getFromSources(
+        'celular',
+        ['phone'],
+        root,
+        customData
+      ),
+      dni_ce: getFromSources('dni_ce', [], root, customData),
+      estado_civil: getFromSources('estado_civil', [], root, customData),
+      distrito_de_residencia: getFromSources(
+        'distrito_de_residencia',
+        ['distrito_de_res'],
+        root,
+        customData
+      ),
+      profesion: getFromSources('profesion', [], root, customData),
+      email: getFromSources('email', [], root, customData),
+      fuente: getFromSources('fuente', [], root, customData),
+      detalle: getFromSources('detalle', [], root, customData),
+      sub_detalle: getFromSources('sub_detalle', [], root, customData),
+      sub_sub_detalle: getFromSources(
+        'sub_sub_detalle',
+        ['sub_sub_detal'],
+        root,
+        customData
+      ),
+      sub_sub_sub_detalle: getFromSources(
+        'sub_sub_sub_detalle',
+        ['sub_sub_sub_'],
+        root,
+        customData
+      ),
+      fecha_de_nacimiento: getFromSources(
+        'fecha_de_nacimiento',
+        ['fecha_de_naci'],
+        root,
+        customData
+      )
     };
 
-    // 5) Construir objeto para insertar en Supabase
+    // 6) Construir payload para Supabase
     const payloadToInsert: ContactRowInsert = {
       hl_contact_id: cleaned.hl_contact_id,
       updated_at: new Date().toISOString()
@@ -144,8 +201,7 @@ export async function POST(req: NextRequest) {
       payloadToInsert.estado_civil = cleaned.estado_civil;
     }
     if (cleaned.distrito_de_residencia !== null) {
-      payloadToInsert.distrito_de_residencia =
-        cleaned.distrito_de_residencia;
+      payloadToInsert.distrito_de_residencia = cleaned.distrito_de_residencia;
     }
     if (cleaned.profesion !== null) {
       payloadToInsert.profesion = cleaned.profesion;
@@ -154,7 +210,7 @@ export async function POST(req: NextRequest) {
       payloadToInsert.email = cleaned.email;
     }
     if (cleaned.fuente !== null) {
-      // en tu BD la columna es fuente_id (FK a tabla fuente)
+      // si tu columna se llama "fuente" en vez de "fuente_id", cámbialo aquí
       payloadToInsert.fuente_id = cleaned.fuente;
     }
     if (cleaned.detalle !== null) {
@@ -170,11 +226,10 @@ export async function POST(req: NextRequest) {
       payloadToInsert.sub_sub_sub_detalle = cleaned.sub_sub_sub_detalle;
     }
     if (cleaned.fecha_de_nacimiento !== null) {
-      // Asumimos formato YYYY-MM-DD que encaja en columna date
       payloadToInsert.fecha_de_nacimiento = cleaned.fecha_de_nacimiento;
     }
 
-    // 6) Upsert en "contactos" usando hl_contact_id como clave única
+    // 7) Upsert en "contactos"
     const { data, error } = await supabaseAdmin
       .from('contactos')
       .upsert(payloadToInsert, {
