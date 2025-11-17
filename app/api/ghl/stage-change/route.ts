@@ -1,149 +1,191 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '../../../../scr/lib/supabaseAdmin'
 
-type Dict = Record<string, unknown>
-const isObj = (v: unknown): v is Dict => typeof v === 'object' && v !== null
-const get = (o: unknown, p: string): unknown => {
-  if (!isObj(o)) return undefined
-  return p.split('.').reduce<unknown>((acc, k) => (isObj(acc) ? (acc as Dict)[k] : undefined), o)
-}
-const S = (o: unknown, p: string) => {
-  const v = get(o, p)
-  if (typeof v === 'string') { const t = v.trim(); return t ? t : undefined }
-  return undefined
-}
-const N = (o: unknown, p: string) => {
-  const v = get(o, p)
-  if (typeof v === 'number') return v
-  if (typeof v === 'string') { const n = Number(v); return Number.isFinite(n) ? n : undefined }
-  return undefined
+interface StageChangePayloadClean {
+  hl_opportunity_id: string;
+  etapa_origen?: string | null;
+  etapa_destino?: string | null;
 }
 
-function resolveDate(body: unknown): Date {
-  const cand = [
-    'changedAt','changed_at',
-    'customData.changedAt','customData.changed_at',
-    'opportunity.updatedAt','opportunity.updated_at',
-    'data.opportunity.updatedAt','data.opportunity.updated_at'
-  ]
-  for (const p of cand) {
-    const n = N(body, p)
-    if (typeof n === 'number' && String(n).length >= 12) {
-      const d = new Date(n); if (!Number.isNaN(d.getTime())) return d
-    }
-    const s = S(body, p); if (s) { const d = new Date(s); if (!Number.isNaN(d.getTime())) return d }
+interface CandidateRow {
+  id: string;
+}
+
+interface HistorialRow {
+  id: string;
+  source: string | null;
+  created_at: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function getStringField(
+  obj: Record<string, unknown>,
+  key: string
+): string | null {
+  const value = obj[key];
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed === '' ? null : trimmed;
   }
-  return new Date()
+  return null;
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const url = new URL(req.url)
-    const token = url.searchParams.get('token')
-    if (token !== process.env.GHL_WEBHOOK_TOKEN) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    // 1) Validar token
+    const url = new URL(req.url);
+    const tokenFromQuery = url.searchParams.get('token');
+    const expectedToken =
+      process.env.GHL_STAGE_CHANGE_TOKEN ??
+      'pit-18b2740c-0b32-40a1-8624-1148633a0f15';
+
+    if (!tokenFromQuery || tokenFromQuery !== expectedToken) {
+      return NextResponse.json(
+        { ok: false, error: 'Unauthorized: invalid token' },
+        { status: 401 }
+      );
     }
 
-    const body = await req.json().catch(() => ({} as unknown))
-    console.log('[GHL stage-change body]', JSON.stringify(body))
-
-    const hlOpportunityId =
-      S(body, 'customData.opportunityId') ?? S(body, 'opportunityId') ??
-      S(body, 'opportunity.id') ?? S(body, 'data.opportunity.id')
-
-    const etapaDestino =
-      S(body, 'customData.newStageName') ?? S(body, 'newStageName') ??
-      S(body, 'opportunity.stage_name') ?? S(body, 'opportunity.stageName') ??
-      S(body, 'data.opportunity.stage_name') ?? S(body, 'data.opportunity.stageName')
-
-    if (!hlOpportunityId || !etapaDestino) {
-      return NextResponse.json({ error: 'Missing opportunityId or stage' }, { status: 400 })
+    // 2) Leer body
+    const rawBody: unknown = await req.json();
+    if (!isRecord(rawBody)) {
+      return NextResponse.json(
+        { ok: false, error: 'Invalid payload format' },
+        { status: 400 }
+      );
     }
 
-    const changedAt = resolveDate(body)
+    const root = rawBody;
 
-    // Debe existir el candidato YA (si no, no es un cambio válido)
-    const { data: cand } = await supabaseAdmin
-      .from('candidatos')
-      .select('id, etapa_actual')
-      .eq('hl_opportunity_id', hlOpportunityId)
-      .maybeSingle()
-
-    const candidatoId: string | null = cand?.id ?? null
-    let etapaOrigen: string | null = cand?.etapa_actual ?? null
-    if (!candidatoId) {
-      return NextResponse.json({ ok: true, skipped: 'no-candidato-yet' })
+    // 3) Extraer opportunity y customData si existen
+    let opportunityObj: Record<string, unknown> = {};
+    if ('opportunity' in root && isRecord(root['opportunity'])) {
+      opportunityObj = root['opportunity'] as Record<string, unknown>;
     }
 
-    // Último historial para definir origen real y evitar duplicados
-    const { data: lastHist } = await supabaseAdmin
-      .from('historial_etapas')
-      .select('etapa_destino, source, changed_at')
-      .eq('hl_opportunity_id', hlOpportunityId)
-      .order('changed_at', { ascending: false })
-      .limit(1)
-      .maybeSingle()
-
-    if (!etapaOrigen && lastHist?.etapa_destino) {
-      etapaOrigen = lastHist.etapa_destino
+    let customData: Record<string, unknown> = {};
+    if ('customData' in root && isRecord(root['customData'])) {
+      customData = root['customData'] as Record<string, unknown>;
     }
 
-    // Si no hay historial previo (raro) y tampoco origen, no registramos: creación no se procesó aún
-    if (!lastHist && !etapaOrigen) {
-      return NextResponse.json({ ok: true, skipped: 'initial-not-ready' })
+    // 4) Resolver hl_opportunity_id
+    let hlOpportunityId =
+      getStringField(customData, 'hl_opportunity_id') ??
+      getStringField(root, 'hl_opportunity_id');
+
+    if (!hlOpportunityId) {
+      hlOpportunityId =
+        getStringField(opportunityObj, 'id') ??
+        getStringField(root, 'opportunity_id');
     }
 
-    // Evitar “sin cambio real”
-    if (etapaOrigen && etapaDestino && etapaOrigen === etapaDestino) {
-      return NextResponse.json({ ok: true, skipped: 'no-stage-change' })
+    if (!hlOpportunityId) {
+      console.error('Body sin hl_opportunity_id reconocible (stage-change):', root);
+      return NextResponse.json(
+        { ok: false, error: 'Missing hl_opportunity_id' },
+        { status: 400 }
+      );
     }
 
-    // Debounce: si el último fue SISTEMA con mismo destino hace < 90s, ignorar
-    if (lastHist?.source === 'SISTEMA' && lastHist?.etapa_destino === etapaDestino) {
-      const lastTs = new Date(lastHist.changed_at as string).getTime()
-      if (changedAt.getTime() - lastTs < 90_000) {
-        return NextResponse.json({ ok: true, skipped: 'debounced-dup-after-create' })
-      }
-    }
-
-    // usuario (opcional)
-    const userGhlId =
-      S(body, 'customData.userGhlId') ?? S(body, 'userGhlId') ??
-      S(body, 'opportunity.updatedBy') ?? S(body, 'data.opportunity.updatedBy')
-
-    let usuarioId: string | null = null
-    if (userGhlId) {
-      const { data: usr } = await supabaseAdmin
-        .from('usuarios')
-        .select('id')
-        .eq('ghl_id', userGhlId)
-        .maybeSingle()
-      usuarioId = usr?.id ?? null
-    }
-
-    // Insertar historial (si llegamos hasta aquí, hay cambio real)
-    const { error: histErr } = await supabaseAdmin.from('historial_etapas').insert([{
-      candidato_id: candidatoId,              // <- siempre lo ponemos
+    // 5) Limpiar etapas
+    const cleaned: StageChangePayloadClean = {
       hl_opportunity_id: hlOpportunityId,
-      etapa_origen: etapaOrigen,
-      etapa_destino: etapaDestino,
-      changed_at: changedAt.toISOString(),
-      source: 'WEBHOOK_HL',
-      usuario_id: usuarioId
-    }])
+      etapa_origen: getStringField(customData, 'etapa_origen'),
+      etapa_destino: getStringField(customData, 'etapa_destino')
+    };
 
-    if (histErr) {
-      console.error('Supabase insert historial error', histErr)
-      return NextResponse.json({ ok: false, error: histErr.message }, { status: 500 })
+    const etapaDestinoFinal = cleaned.etapa_destino ?? 'SIN_ETAPA';
+
+    // 6) Buscar candidato por hl_opportunity_id
+    const { data: candidatoRow, error: candidatoError } = await supabaseAdmin
+      .from('candidatos')
+      .select<'id', CandidateRow>('id')
+      .eq('hl_opportunity_id', cleaned.hl_opportunity_id)
+      .maybeSingle();
+
+    if (candidatoError) {
+      console.error('Error buscando candidato por hl_opportunity_id:', candidatoError);
+      return NextResponse.json(
+        { ok: false, error: 'supabase_error', details: candidatoError.message },
+        { status: 500 }
+      );
     }
 
-    return NextResponse.json({ ok: true })
-  } catch (e) {
-    console.error(e)
-    return NextResponse.json({ error: 'Server error' }, { status: 500 })
-  }
-}
+    if (!candidatoRow) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'not_found',
+          details: 'No candidate found for that hl_opportunity_id'
+        },
+        { status: 404 }
+      );
+    }
 
-export async function GET() {
-  return NextResponse.json({ ok: true })
+    const candidatoId = candidatoRow.id;
+
+    // 7) Verificar si ya hay un registro SISTEMA muy reciente (últimos ~10s)
+    const tenSecondsAgoIso = new Date(Date.now() - 10_000).toISOString();
+
+    const { data: recientes, error: recientesError } = await supabaseAdmin
+      .from('historial_etapas')
+      .select<'id, source, created_at', HistorialRow>('id, source, created_at')
+      .eq('candidato_id', candidatoId)
+      .eq('source', 'SISTEMA')
+      .gte('created_at', tenSecondsAgoIso);
+
+    if (recientesError) {
+      console.error('Error consultando historial_etapas recientes:', recientesError);
+      // no bloqueamos por este error; seguimos insertando
+    }
+
+    if (recientes && recientes.length > 0) {
+      // Hay un registro SISTEMA muy reciente (proveniente del trigger de creación)
+      // Evitamos duplicar el evento de creación.
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: 'recent_system_initial_stage'
+      });
+    }
+
+    // 8) Insertar cambio de etapa normal
+    const nowIso = new Date().toISOString();
+
+    const { data: insertData, error: insertError } = await supabaseAdmin
+      .from('historial_etapas')
+      .insert({
+        candidato_id: candidatoId,
+        etapa_origen: cleaned.etapa_origen,
+        etapa_destino: etapaDestinoFinal,
+        changed_at: nowIso,
+        source: 'WEBHOOK_HL',
+        created_at: nowIso
+      })
+      .select('id')
+      .single();
+
+    if (insertError) {
+      console.error('Error insertando historial_etapas (stage-change):', insertError);
+      return NextResponse.json(
+        { ok: false, error: 'supabase_error', details: insertError.message },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      historial_etapas_id: insertData.id,
+      candidato_id: candidatoId
+    });
+  } catch (err) {
+    console.error('Unexpected error in /ghl/stage-change:', err);
+    return NextResponse.json(
+      { ok: false, error: 'unexpected_error' },
+      { status: 500 }
+    );
+  }
 }
