@@ -3,14 +3,19 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '../../../../scr/lib/supabaseAdmin';
 
 interface AppointmentPayloadClean {
-  hl_opportunity_id: string;
+  hl_contact_id: string;
   ghl_appointment_id: string;
   titulo: string | null;
   fecha_hora_inicio: string | null;
 }
 
+interface ContactRow {
+  id: string; // contactos.id (uuid)
+}
+
 interface CandidateRow {
-  id: string;
+  id: string;              // candidatos.id (uuid)
+  fecha_creacion: string;  // candidatos.fecha_creacion (timestamp)
 }
 
 interface CitaRowInsert {
@@ -82,10 +87,10 @@ export async function POST(req: NextRequest) {
 
     const root = rawBody;
 
-    // 3) Extraer objetos opportunity, appointment y customData si existen
-    let opportunityObj: Record<string, unknown> = {};
-    if ('opportunity' in root && isRecord(root['opportunity'])) {
-      opportunityObj = root['opportunity'] as Record<string, unknown>;
+    // 3) Extraer contact, appointment y customData si existen
+    let contactObj: Record<string, unknown> = {};
+    if ('contact' in root && isRecord(root['contact'])) {
+      contactObj = root['contact'] as Record<string, unknown>;
     }
 
     let appointmentObj: Record<string, unknown> = {};
@@ -98,21 +103,21 @@ export async function POST(req: NextRequest) {
       customData = root['customData'] as Record<string, unknown>;
     }
 
-    // 4) Resolver hl_opportunity_id
-    let hlOpportunityId =
-      getStringField(customData, 'hl_opportunity_id') ??
-      getStringField(root, 'hl_opportunity_id');
+    // 4) Resolver hl_contact_id
+    let hlContactId =
+      getStringField(customData, 'hl_contact_id') ??
+      getStringField(root, 'hl_contact_id');
 
-    if (!hlOpportunityId) {
-      hlOpportunityId =
-        getStringField(opportunityObj, 'id') ??
-        getStringField(root, 'opportunity_id');
+    if (!hlContactId) {
+      hlContactId =
+        getStringField(contactObj, 'id') ??
+        getStringField(root, 'contact_id');
     }
 
-    if (!hlOpportunityId) {
-      console.error('Body sin hl_opportunity_id (appointment):', root);
+    if (!hlContactId) {
+      console.error('Body sin hl_contact_id (appointment):', root);
       return NextResponse.json(
-        { ok: false, error: 'Missing hl_opportunity_id' },
+        { ok: false, error: 'Missing hl_contact_id' },
         { status: 400 }
       );
     }
@@ -147,22 +152,55 @@ export async function POST(req: NextRequest) {
       getStringField(appointmentObj, 'start');
 
     const cleaned: AppointmentPayloadClean = {
-      hl_opportunity_id: hlOpportunityId,
+      hl_contact_id: hlContactId,
       ghl_appointment_id: ghlAppointmentId,
       titulo,
       fecha_hora_inicio: fechaInicioRaw
     };
 
-    // 7) Buscar candidato_id en tabla candidatos usando hl_opportunity_id
+    // 7) Buscar contacto_id en tabla contactos usando hl_contact_id
+    const { data: contactRow, error: contactError } = await supabaseAdmin
+      .from('contactos')
+      .select<'id', ContactRow>('id')
+      .eq('hl_contact_id', cleaned.hl_contact_id)
+      .maybeSingle();
+
+    if (contactError) {
+      console.error(
+        'Error buscando contacto por hl_contact_id (appointment):',
+        contactError
+      );
+      return NextResponse.json(
+        { ok: false, error: 'supabase_error', details: contactError.message },
+        { status: 500 }
+      );
+    }
+
+    if (!contactRow) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'contact_not_found',
+          details: 'No contact found for that hl_contact_id'
+        },
+        { status: 404 }
+      );
+    }
+
+    const contactoId = contactRow.id;
+
+    // 8) Buscar la ÚLTIMA oportunidad (candidato) de ese contacto
     const { data: candidatoRow, error: candidatoError } = await supabaseAdmin
       .from('candidatos')
-      .select<'id', CandidateRow>('id')
-      .eq('hl_opportunity_id', cleaned.hl_opportunity_id)
+      .select<'id, fecha_creacion', CandidateRow>('id, fecha_creacion')
+      .eq('contacto_id', contactoId)
+      .order('fecha_creacion', { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (candidatoError) {
       console.error(
-        'Error buscando candidato por hl_opportunity_id (appointment):',
+        'Error buscando último candidato por contacto_id (appointment):',
         candidatoError
       );
       return NextResponse.json(
@@ -176,7 +214,8 @@ export async function POST(req: NextRequest) {
         {
           ok: false,
           error: 'candidate_not_found',
-          details: 'No candidate found for that hl_opportunity_id'
+          details:
+            'No candidate found for that contact. Cannot link appointment to candidato.'
         },
         { status: 404 }
       );
@@ -184,13 +223,13 @@ export async function POST(req: NextRequest) {
 
     const candidatoId = candidatoRow.id;
 
-    // 8) Inferir tipo según el título
+    // 9) Inferir tipo según el título
     const tipo = inferTipo(cleaned.titulo);
 
     const nowIso = new Date().toISOString();
     const fechaInicioFinal = cleaned.fecha_hora_inicio ?? nowIso;
 
-    // 9) Construir fila para insertar en citas_programadas
+    // 🔟 Construir fila para insertar en citas_programadas
     const insertPayload: CitaRowInsert = {
       candidato_id: candidatoId,
       ghl_appointment_id: cleaned.ghl_appointment_id,
@@ -219,6 +258,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       candidato_id: candidatoId,
+      contacto_id: contactoId,
       ghl_appointment_id: insertData.ghl_appointment_id,
       tipo
     });
