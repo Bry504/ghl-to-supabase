@@ -1,167 +1,141 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '../../../../scr/lib/supabaseAdmin'
 
-type Dict = Record<string, unknown>
-const isObj = (v: unknown): v is Dict => typeof v === 'object' && v !== null
-const get = (o: unknown, p: string): unknown => {
-  if (!isObj(o)) return undefined
-  return p.split('.').reduce<unknown>((acc, k) => (isObj(acc) ? (acc as Dict)[k] : undefined), o)
-}
-const S = (o: unknown, p: string) => {
-  const v = get(o, p)
-  if (typeof v === 'string') { const t = v.trim(); return t ? t : undefined }
-  return undefined
-}
-const D = (o: unknown, p: string): Date | undefined => {
-  const v = get(o, p)
-  if (v instanceof Date) return v
-  if (typeof v === 'number') { const d = new Date(v); return Number.isNaN(d.getTime()) ? undefined : d }
-  if (typeof v === 'string') { const d = new Date(v); return Number.isNaN(d.getTime()) ? undefined : d }
-  return undefined
+interface LostPayloadClean {
+  hl_opportunity_id: string;
+  motivo_de_perdida: string | null;
 }
 
-async function tryUnassignInGHL(opportunityId: string): Promise<{ ok: boolean; status: number }> {
-  // En HL/LeadConnector suele ser PATCH /opportunities/{id} con { assignedTo: null } o "".
-  // Implementamos dos intentos seguros; si ambos fallan, solo lo logueamos.
-  const base = 'https://services.leadconnectorhq.com'
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${process.env.GHL_API_KEY ?? ''}`,
-    Version: '2021-07-28',
-    'Content-Type': 'application/json'
+interface CandidateIdRow {
+  id: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function getStringField(
+  obj: Record<string, unknown>,
+  key: string
+): string | null {
+  const value = obj[key];
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed === '' ? null : trimmed;
   }
-
-  // Intento 1: assignedTo: null
-  let r = await fetch(`${base}/opportunities/${encodeURIComponent(opportunityId)}`, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify({ assignedTo: null })
-  })
-  if (r.ok) return { ok: true, status: r.status }
-
-  // Intento 2: assignedTo: '' (string vacío)
-  r = await fetch(`${base}/opportunities/${encodeURIComponent(opportunityId)}`, {
-    method: 'PATCH',
-    headers,
-    body: JSON.stringify({ assignedTo: '' })
-  })
-  return { ok: r.ok, status: r.status }
+  return null;
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const url = new URL(req.url)
-    const token = url.searchParams.get('token')
-    if (token !== process.env.GHL_WEBHOOK_TOKEN) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    // 1) Validar token
+    const url = new URL(req.url);
+    const tokenFromQuery = url.searchParams.get('token');
+    const expectedToken =
+      process.env.GHL_OPPORTUNITY_LOST_TOKEN ??
+      'pit-18b2740c-0b32-40a1-8624-1148633a0f15';
+
+    if (!tokenFromQuery || tokenFromQuery !== expectedToken) {
+      return NextResponse.json(
+        { ok: false, error: 'Unauthorized: invalid token' },
+        { status: 401 }
+      );
     }
 
-    const body = await req.json().catch(() => ({} as unknown))
-    console.log('[GHL lost body]', JSON.stringify(body))
-
-    // Esperamos que el workflow de HL mande por Custom Data:
-    // opportunityId, currentStageName, lostAt, lostReason, assignedTo
-    const oppId =
-      S(body, 'customData.opportunityId') ?? S(body, 'opportunityId') ??
-      S(body, 'opportunity.id') ?? S(body, 'data.opportunity.id')
-    if (!oppId) return NextResponse.json({ error: 'Missing opportunityId' }, { status: 400 })
-
-    const etapaActual =
-      S(body, 'customData.currentStageName') ?? S(body, 'currentStageName') ??
-      S(body, 'opportunity.stage_name') ?? S(body, 'opportunity.stageName') ??
-      S(body, 'data.opportunity.stage_name') ?? S(body, 'data.opportunity.stageName') ?? 'Desconocida'
-
-    const fechaPerdida =
-      D(body, 'customData.lostAt') ?? D(body, 'lostAt') ??
-      D(body, 'opportunity.updated_at') ?? D(body, 'data.opportunity.updated_at') ?? new Date()
-
-    const razonPerdida =
-      S(body, 'customData.lostReason') ?? S(body, 'lostReason') ??
-      S(body, 'opportunity.lost_reason') ?? S(body, 'data.opportunity.lost_reason')
-
-    const duenioHlId =
-      S(body, 'customData.assignedTo') ?? S(body, 'assignedTo') ??
-      S(body, 'opportunity.assignedTo') ?? S(body, 'data.opportunity.assignedTo')
-
-    // Buscar candidato por opportunity id
-    const { data: cand } = await supabaseAdmin
-      .from('candidatos')
-      .select('id')
-      .eq('hl_opportunity_id', oppId)
-      .maybeSingle()
-
-    const candidatoId = cand?.id ?? null
-
-    // Mapear a usuarios.id por ghl_id
-    let usuarioId: string | null = null
-    if (duenioHlId) {
-      const { data: usr } = await supabaseAdmin
-        .from('usuarios')
-        .select('id')
-        .eq('ghl_id', duenioHlId)
-        .maybeSingle()
-      if (usr?.id) usuarioId = usr.id
+    // 2) Leer body
+    const rawBody: unknown = await req.json();
+    if (!isRecord(rawBody)) {
+      return NextResponse.json(
+        { ok: false, error: 'Invalid payload format' },
+        { status: 400 }
+      );
     }
 
-    // Inserción en no_contactables
-    const insertNoC = {
-      candidato_id: candidatoId,
-      hl_opportunity_id: oppId,
-      etapa_actual: etapaActual,
-      fecha_perdida: fechaPerdida.toISOString(),
-      duenio_hl_id: duenioHlId ?? null,
-      usuario_id: usuarioId,
-      razon_perdida: razonPerdida ?? null
-    }
-    const { error: errNC } = await supabaseAdmin.from('no_contactables').insert([insertNoC])
-    if (errNC) {
-      console.error('Supabase insert no_contactables error', errNC)
-      return NextResponse.json({ ok: false, error: errNC.message }, { status: 500 })
+    const root = rawBody;
+
+    // 3) Extraer opportunity y customData si existen
+    let opportunityObj: Record<string, unknown> = {};
+    if ('opportunity' in root && isRecord(root['opportunity'])) {
+      opportunityObj = root['opportunity'] as Record<string, unknown>;
     }
 
-    // Actualiza candidato (estado/etapa/fecha)
-    const { error: errCand } = await supabaseAdmin
+    let customData: Record<string, unknown> = {};
+    if ('customData' in root && isRecord(root['customData'])) {
+      customData = root['customData'] as Record<string, unknown>;
+    }
+
+    // 4) Resolver hl_opportunity_id
+    let hlOpportunityId =
+      getStringField(customData, 'hl_opportunity_id') ??
+      getStringField(root, 'hl_opportunity_id');
+
+    if (!hlOpportunityId) {
+      hlOpportunityId =
+        getStringField(opportunityObj, 'id') ??
+        getStringField(root, 'opportunity_id');
+    }
+
+    if (!hlOpportunityId) {
+      console.error('Body sin hl_opportunity_id (opportunity-lost):', root);
+      return NextResponse.json(
+        { ok: false, error: 'Missing hl_opportunity_id' },
+        { status: 400 }
+      );
+    }
+
+    // 5) Limpiar motivo_de_perdida
+    const motivoDePerdida =
+      getStringField(customData, 'motivo_de_perdida') ??
+      getStringField(root, 'motivo_de_perdida');
+
+    const cleaned: LostPayloadClean = {
+      hl_opportunity_id: hlOpportunityId,
+      motivo_de_perdida: motivoDePerdida
+    };
+
+    const nowIso = new Date().toISOString();
+
+    // 6) Actualizar candidato cruzando por hl_opportunity_id
+    const { data: updatedRow, error: updateError } = await supabaseAdmin
       .from('candidatos')
       .update({
         estado: 'PERDIDA',
-        etapa_actual: etapaActual,
-        stage_changed_at: fechaPerdida.toISOString(),
-        updated_at: new Date().toISOString()
+        motivo_de_perdida: cleaned.motivo_de_perdida,
+        updated_at: nowIso
       })
-      .eq('hl_opportunity_id', oppId)
-    if (errCand) console.error('Supabase update candidato error', errCand)
+      .eq('hl_opportunity_id', cleaned.hl_opportunity_id)
+      .select<'id', CandidateIdRow>('id')
+      .maybeSingle();
 
-    // (Opcional) registra historial de etapas con source=WEBHOOK_HL
-    if (candidatoId) {
-      await supabaseAdmin.from('historial_etapas').insert([{
-        candidato_id: candidatoId,
-        hl_opportunity_id: oppId,
-        etapa_origen: etapaActual,            // si quieres puedes leer la anterior, pero aquí anotamos la final
-        etapa_destino: etapaActual,
-        changed_at: fechaPerdida.toISOString(),
-        source: 'WEBHOOK_HL',
-        usuario_id: usuarioId
-      }])
+    if (updateError) {
+      console.error('Error actualizando candidato (opportunity-lost):', updateError);
+      return NextResponse.json(
+        { ok: false, error: 'supabase_error', details: updateError.message },
+        { status: 500 }
+      );
     }
 
-    // Desasignar en HighLevel (para poder reasignar la base)
-    let unassignStatus: number | null = null
-    if (process.env.GHL_API_KEY) {
-      const res = await tryUnassignInGHL(oppId)
-      unassignStatus = res.status
-      if (!res.ok) {
-        console.error('GHL unassign failed. status=', res.status)
-      }
-    } else {
-      console.warn('GHL_API_KEY not set; skipping unassign call')
+    if (!updatedRow) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: 'not_found',
+          details: 'No candidate found for that hl_opportunity_id'
+        },
+        { status: 404 }
+      );
     }
 
-    return NextResponse.json({ ok: true, unassignStatus })
-  } catch (e) {
-    console.error(e)
-    return NextResponse.json({ error: 'Server error' }, { status: 500 })
+    return NextResponse.json({
+      ok: true,
+      candidato_id: updatedRow.id,
+      estado: 'PERDIDA'
+    });
+  } catch (err) {
+    console.error('Unexpected error in /ghl/opportunity-lost:', err);
+    return NextResponse.json(
+      { ok: false, error: 'unexpected_error' },
+      { status: 500 }
+    );
   }
-}
-
-export async function GET() {
-  return NextResponse.json({ ok: true })
 }
