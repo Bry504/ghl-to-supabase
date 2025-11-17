@@ -15,6 +15,8 @@ interface HistorialRow {
   id: string;
   source: string | null;
   created_at: string;
+  etapa_destino: string | null;
+  etapa_origen?: string | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -83,7 +85,10 @@ export async function POST(req: NextRequest) {
     }
 
     if (!hlOpportunityId) {
-      console.error('Body sin hl_opportunity_id reconocible (stage-change):', root);
+      console.error(
+        'Body sin hl_opportunity_id reconocible (stage-change):',
+        root
+      );
       return NextResponse.json(
         { ok: false, error: 'Missing hl_opportunity_id' },
         { status: 400 }
@@ -107,7 +112,10 @@ export async function POST(req: NextRequest) {
       .maybeSingle();
 
     if (candidatoError) {
-      console.error('Error buscando candidato por hl_opportunity_id:', candidatoError);
+      console.error(
+        'Error buscando candidato por hl_opportunity_id:',
+        candidatoError
+      );
       return NextResponse.json(
         { ok: false, error: 'supabase_error', details: candidatoError.message },
         { status: 500 }
@@ -127,24 +135,28 @@ export async function POST(req: NextRequest) {
 
     const candidatoId = candidatoRow.id;
 
-    // 7) Verificar si ya hay un registro SISTEMA muy reciente (últimos ~10s)
+    // 7) Evitar duplicar el evento de creación (SISTEMA en últimos ~10s)
     const tenSecondsAgoIso = new Date(Date.now() - 10_000).toISOString();
 
     const { data: recientes, error: recientesError } = await supabaseAdmin
       .from('historial_etapas')
-      .select<'id, source, created_at', HistorialRow>('id, source, created_at')
+      .select<'id, source, created_at, etapa_destino', HistorialRow>(
+        'id, source, created_at, etapa_destino'
+      )
       .eq('candidato_id', candidatoId)
       .eq('source', 'SISTEMA')
       .gte('created_at', tenSecondsAgoIso);
 
     if (recientesError) {
-      console.error('Error consultando historial_etapas recientes:', recientesError);
-      // no bloqueamos por este error; seguimos insertando
+      console.error(
+        'Error consultando historial_etapas recientes:',
+        recientesError
+      );
+      // seguimos aunque falle esta consulta
     }
 
     if (recientes && recientes.length > 0) {
-      // Hay un registro SISTEMA muy reciente (proveniente del trigger de creación)
-      // Evitamos duplicar el evento de creación.
+      // Ya hay un registro SISTEMA muy reciente (proveniente de la creación)
       return NextResponse.json({
         ok: true,
         skipped: true,
@@ -152,14 +164,35 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 8) Insertar cambio de etapa normal
+    // 8) Si no viene etapa_origen desde HL, tomar la última etapa_destino previa
+    let etapaOrigenFinal = cleaned.etapa_origen ?? null;
+
+    if (!etapaOrigenFinal) {
+      const { data: lastStage, error: lastStageError } = await supabaseAdmin
+        .from('historial_etapas')
+        .select<'id, source, created_at, etapa_destino', HistorialRow>(
+          'id, source, created_at, etapa_destino'
+        )
+        .eq('candidato_id', candidatoId)
+        .order('changed_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (lastStageError) {
+        console.error('Error obteniendo última etapa previa:', lastStageError);
+      } else if (lastStage && lastStage.etapa_destino) {
+        etapaOrigenFinal = lastStage.etapa_destino;
+      }
+    }
+
     const nowIso = new Date().toISOString();
 
+    // 9) Insertar cambio de etapa
     const { data: insertData, error: insertError } = await supabaseAdmin
       .from('historial_etapas')
       .insert({
         candidato_id: candidatoId,
-        etapa_origen: cleaned.etapa_origen,
+        etapa_origen: etapaOrigenFinal,
         etapa_destino: etapaDestinoFinal,
         changed_at: nowIso,
         source: 'WEBHOOK_HL',
@@ -169,7 +202,10 @@ export async function POST(req: NextRequest) {
       .single();
 
     if (insertError) {
-      console.error('Error insertando historial_etapas (stage-change):', insertError);
+      console.error(
+        'Error insertando historial_etapas (stage-change):',
+        insertError
+      );
       return NextResponse.json(
         { ok: false, error: 'supabase_error', details: insertError.message },
         { status: 500 }
@@ -179,7 +215,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       historial_etapas_id: insertData.id,
-      candidato_id: candidatoId
+      candidato_id: candidatoId,
+      etapa_origen: etapaOrigenFinal,
+      etapa_destino: etapaDestinoFinal
     });
   } catch (err) {
     console.error('Unexpected error in /ghl/stage-change:', err);
