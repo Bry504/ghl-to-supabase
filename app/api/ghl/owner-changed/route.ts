@@ -12,11 +12,6 @@ interface CandidatoRow {
   propietario_id: string | null;
 }
 
-interface UsuarioByIdRow {
-  id: string;
-  ghl_id: string | null;
-}
-
 interface UsuarioByGhlRow {
   id: string;
 }
@@ -217,7 +212,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 9) Insertar fila en reasignaciones + actualizar candidatos
+    // 9) Insertar fila en reasignaciones
     const nowIso = new Date().toISOString();
 
     const reasignacion: ReasignacionInsert = {
@@ -233,13 +228,17 @@ export async function POST(req: NextRequest) {
       .insert(reasignacion);
 
     if (insertError) {
-      console.error('Error insertando en reasignaciones (owner-change):', insertError);
+      console.error(
+        'Error insertando en reasignaciones (owner-change):',
+        insertError
+      );
       return NextResponse.json(
         { ok: false, error: 'supabase_error', details: insertError.message },
         { status: 500 }
       );
     }
 
+    // 🔟 Actualizar propietario_id en candidatos
     const { error: updateError } = await supabaseAdmin
       .from('candidatos')
       .update({
@@ -249,7 +248,10 @@ export async function POST(req: NextRequest) {
       .eq('id', candidatoId);
 
     if (updateError) {
-      console.error('Error actualizando propietario en candidatos (owner-change):', updateError);
+      console.error(
+        'Error actualizando propietario en candidatos (owner-change):',
+        updateError
+      );
       return NextResponse.json(
         { ok: false, error: 'supabase_error', details: updateError.message },
         { status: 500 }
