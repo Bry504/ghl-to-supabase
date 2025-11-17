@@ -25,7 +25,7 @@ interface CandidateRowInsert {
   producto?: string | null;
   proyecto?: string | null;
   modalidad_de_pago?: string | null;
-  fecha_creacion: string;
+  created_at: string;
   updated_at: string;
 }
 
@@ -202,7 +202,7 @@ export async function POST(req: NextRequest) {
       producto: cleaned.producto ?? null,
       proyecto: cleaned.proyecto ?? null,
       modalidad_de_pago: cleaned.modalidad_de_pago ?? null,
-      fecha_creacion: nowIso,
+      created_at: nowIso,
       updated_at: nowIso
     };
 
